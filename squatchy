@@ -1,0 +1,1431 @@
+#!/usr/bin/env python3
+"""Squatchy — a Pacific Northwest scene in ASCII art, in the spirit of asciiquarium.
+
+Keys:
+  q       quit
+  p/space pause
+  r       redraw / rebuild the scene
+  w       toggle rain
+  n       skip to the next time of day
+  s       (shhh) summon a sasquatch
+  o       (shhh) summon an orca
+
+Requires only Python 3 and a curses-capable terminal.
+"""
+
+import curses
+import math
+import random
+import time
+
+FRAME_MS = 65          # ~15 fps
+HINT_SECONDS = 6
+
+# day/night cycle (seconds)
+DAY_LEN, DUSK_LEN, NIGHT_LEN, DAWN_LEN = 150, 25, 150, 25
+CYCLE_LEN = DAY_LEN + DUSK_LEN + NIGHT_LEN + DAWN_LEN
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+MIRROR_MAP = str.maketrans(r"/\()<>[]{}`'", r"\/)(><][}{'`")
+
+
+def mirror(art):
+    lines = art.split("\n")
+    w = max(len(l) for l in lines) if lines else 0
+    return "\n".join(l.ljust(w)[::-1].translate(MIRROR_MAP) for l in lines)
+
+
+def frame_lines(art):
+    lines = art.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    w = max((len(l) for l in lines), default=0)
+    return [l.ljust(w) for l in lines]
+
+
+def mask_from(art, mapping):
+    return "\n".join(
+        "".join(mapping.get(ch, " ") for ch in line) for line in art.split("\n")
+    )
+
+
+def smooth(t):
+    """ease-in-out 0..1"""
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+# --------------------------------------------------------------------------
+# colors — extended 256-color palette with 8-color fallback
+# --------------------------------------------------------------------------
+
+BASE_COLORS = {
+    "k": curses.COLOR_BLACK, "r": curses.COLOR_RED, "g": curses.COLOR_GREEN,
+    "y": curses.COLOR_YELLOW, "b": curses.COLOR_BLUE, "m": curses.COLOR_MAGENTA,
+    "c": curses.COLOR_CYAN, "w": curses.COLOR_WHITE,
+}
+
+# letter -> (xterm-256 color, fallback base letter)
+EXT_COLORS = {
+    "t": (94, "y"),    # dark brown (trunks, bear, footprints)
+    "T": (137, "Y"),   # warm brown (deer, sasquatch highlights)
+    "f": (22, "g"),    # deep fir green
+    "F": (28, "G"),    # brighter fir
+    "d": (240, "K"),   # dark gray (far ridge, orca, smoke)
+    "l": (246, "w"),   # gray (near ridge, mist)
+    "L": (253, "W"),   # light gray (moon, snow shine)
+    "n": (24, "b"),    # deep sound blue
+    "N": (38, "c"),    # water highlight
+    "o": (208, "r"),   # ember orange
+    "S": (94, "y"),    # sasquatch fur (deep brown)
+}
+
+ATTRS = {}
+_PAIR = {}
+
+
+def _pair_for(colnum):
+    if colnum not in _PAIR:
+        idx = len(_PAIR) + 1
+        try:
+            curses.init_pair(idx, colnum, -1)
+        except curses.error:
+            return curses.A_NORMAL
+        _PAIR[colnum] = curses.color_pair(idx)
+    return _PAIR[colnum]
+
+
+def init_colors():
+    ATTRS.clear()
+    _PAIR.clear()
+    if not curses.has_colors():
+        for letter in list(BASE_COLORS) + list(EXT_COLORS):
+            ATTRS[letter] = curses.A_NORMAL
+            ATTRS[letter.upper()] = curses.A_BOLD
+        ATTRS["E"] = curses.A_BOLD
+        return
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+    many = curses.COLORS >= 256
+    for letter, num in BASE_COLORS.items():
+        ATTRS[letter] = _pair_for(num)
+        ATTRS[letter.upper()] = _pair_for(num) | curses.A_BOLD
+    for letter, (num, fb) in EXT_COLORS.items():
+        if many:
+            ATTRS[letter] = _pair_for(num)
+        else:
+            ATTRS[letter] = ATTRS[fb.lower()] | (curses.A_BOLD if fb.isupper() else 0)
+    ATTRS["E"] = ATTRS["W"]  # sasquatch eyes; re-pointed red at night
+
+
+def set_night_palette(is_night):
+    if "R" in ATTRS and "W" in ATTRS:
+        ATTRS["E"] = ATTRS["R"] if is_night else ATTRS["W"]
+
+
+# --------------------------------------------------------------------------
+# art
+# --------------------------------------------------------------------------
+
+CLOUDS = [
+    r"""
+      .--.
+   .-(    )-.
+  (___.__)___)
+""",
+    r"""
+    .---.
+   (     )-.
+  (___,____)
+""",
+    r"""
+  .--..--.
+ (__)(____)
+""",
+]
+
+WISP = r"""
+ ~~--~~~---~~--~
+"""
+
+SUN = r"""
+  \ | /
+-- (#) --
+  / | \
+"""
+
+MOON = r"""
+    _..
+  .' .'
+ |  (
+  '. '._
+    '-..'
+"""
+
+EAGLE_GLIDE = r"""
+ ______           ______
+       \\__     __//
+          \(o)>/
+"""
+
+EAGLE_UP = r"""
+  \               /
+   \\           //
+    \\__     __//
+       \(o)>/
+"""
+
+EAGLE_DOWN = r"""
+       _(o)>_
+   __//     \\__
+  //           \\
+"""
+
+OWL_FRAMES = [
+    r"""
+  /\     /\
+ ( (o) (o) )
+  \(     )/
+    " " "
+""",
+    r"""
+ __         __
+   \( o o )/
+    (     )
+     " " "
+""",
+]
+
+GEESE = r"""
+v    v
+   v     v
+ v    v
+"""
+
+DEER_FRAMES = [
+    r"""
+             \/ \/
+              \_/
+   ___________(o'
+  /#############\
+  \##############'
+    ||        ||
+    ||        ||
+    ''        ''
+""",
+    r"""
+             \/ \/
+              \_/
+   ___________(o'
+  /#############\
+  \##############'
+    /|        |\
+   / |        | \
+  ''  '      '  ''
+""",
+]
+
+ELK_FRAMES = [
+    r"""
+   \\|//    \\|//
+     \|      |/
+      \\.  .//
+       \\__//
+   _____(oo'
+  /###########\
+  \############'
+    ||      ||
+    ||      ||
+    ''      ''
+""",
+    r"""
+   \\|//    \\|//
+     \|      |/
+      \\.  .//
+       \\__//
+   _____(oo'
+  /###########\
+  \############'
+    /|      |\
+   / |      | \
+  ''  '    '  ''
+""",
+]
+
+BEAR_FRAMES = [
+    r"""
+        _.--~~--._
+      .'##########'-.___
+     /###################'--.
+    |#####################.--'\
+    |#####################|o###\
+     \#######____########'--,__/
+      |#####|    |#####___##|
+      |     |    |    |   | |
+     _|    _|   _|   _|  _| |_
+    (_'   (_'  (_'  (_' (_'(__'
+""",
+    r"""
+        _.--~~--._
+      .'##########'-.___
+     /###################'--.
+    |#####################.--'\
+    |#####################|o###\
+     \#######____########'--,__/
+      |#####|    |#####___##|
+      /     |    /    |   / |
+     _/    _|  _/    _|  _/ |_
+    (_'   (_' (_'   (_' (_'(__'
+""",
+]
+
+RABBIT_GROUND = r"""
+  (\_/)
+  (o.o)
+ (")_(")
+"""
+
+RABBIT_AIR = r"""
+   (\_/)
+  (o.o)_
+ (")  (")~
+"""
+
+SQUATCH_HEAD = r"""
+           .-~~~-.
+          /?o?.?o?\
+          |?.?~?.?|
+          '.??-??.'
+        .--'#####'--.
+       /.###########.\
+      //#############\\
+     |/|#############|\|
+     ||.|###########|.||
+     (_/|###########|\_)
+"""
+
+SQUATCH_LEGS_A = r"""
+         ####?####
+         ###|?|###
+        _###|?|###_
+       (____)?(____)
+"""
+
+SQUATCH_LEGS_B = r"""
+         ####?####
+        ###/???\###
+      _###/?????\###_
+     (____)?????(____)
+"""
+
+SQUATCH_FRAMES = [
+    SQUATCH_HEAD.strip("\n") + "\n" + SQUATCH_LEGS_A.strip("\n"),
+    SQUATCH_HEAD.strip("\n") + "\n" + SQUATCH_LEGS_B.strip("\n"),
+]
+
+BABY_SQUATCH_FRAMES = [
+    r"""
+     .-~-.
+    /o?.?o\
+    '.?-?.'
+   .'#####'.
+  (,#######,)
+   '#######'
+     ##?##
+    ##???##
+   _##???##_
+  (___)?(___)
+""",
+    r"""
+     .-~-.
+    /o?.?o\
+    '.?-?.'
+   .'#####'.
+  (,#######,)
+   '#######'
+     ##?##
+    ##/?\##
+  _##/???\##_
+ (___)???(___)
+""",
+]
+
+# --- orca: surfacing roll + breach -----------------------------------------
+
+ORCA_BLOW = r"""
+       . : ' .
+        \ | /
+     _.--:--.
+ __.'    o   \
+"""
+
+ORCA_ROLL = r"""
+             __
+            |  \
+     ___.--''   ''--.___
+ __.'        o          '.__
+"""
+
+ORCA_SINK = r"""
+      _
+     | \_
+  _.'    ''--..__
+"""
+
+ORCA_LEAP = r"""
+                _
+               /o'.
+          __  /    \
+        _/  \/      |
+      .'            |
+     /   __     __.'
+    (_.-'  \___/
+"""
+
+ORCA_DIVE = r"""
+    ___
+   /   \'--.___
+  |  o        '--.
+  |     __       '\
+   \_.-'  \__     |
+              \___/
+"""
+
+SPLASH_FRAMES = [
+    r"""
+    . ' .
+   ~ ~ ~ ~
+""",
+    r"""
+  .  ' :  ' .
+ ~ ~ ~~~~~ ~ ~
+""",
+    r"""
+ :   .   .   :
+~ ~ ~ ~ ~ ~ ~ ~
+""",
+]
+
+SALMON = r"""
+ <')))><
+"""
+
+BOLT = r"""
+ \
+  \
+  /
+ /__
+    \
+     \
+"""
+
+TREES = [
+    r"""
+      /\
+     /  \
+    /_/\_\
+     /  \
+    /    \
+   /_/  \_\
+    /    \
+   /      \
+  /_/    \_\
+    /    \
+   /      \
+  /________\
+      ||
+      ||
+""",
+    r"""
+     /\
+    /  \
+   /_/\_\
+    /  \
+   /    \
+  /_/  \_\
+   /    \
+  /      \
+ /________\
+     ||
+""",
+    r"""
+    /\
+   /  \
+  /    \
+  /    \
+ /      \
+/________\
+    ||
+""",
+    r"""
+   /\
+  /  \
+ /    \
+/______\
+   ||
+""",
+]
+
+TENT = r"""
+       /\
+      /  \
+     / __ \
+    / /  \ \
+   /_/____\_\
+"""
+
+FIRE_FRAMES = [
+    r"""
+   (  )
+  ( )( )
+  _\||/_
+""",
+    r"""
+   )  (
+ ( ( ) )
+  _\||/_
+""",
+    r"""
+    ) (
+  ( )( )
+  _\||/_
+""",
+]
+
+FIRE_MASKS = []
+for _f, _c in zip(FIRE_FRAMES, ("Y", "o", "R")):
+    FIRE_MASKS.append("\n".join(
+        "".join(("t" if "_" in line else _c) if ch != " " else " " for ch in line)
+        for line in _f.split("\n")
+    ))
+
+
+def tree_frames(art):
+    """Two frames: still, and canopy nudged a column (wind sway)."""
+    lines = art.split("\n")
+    trunk_start = next((i for i, l in enumerate(lines) if "|" in l and "/" not in l), len(lines))
+    swayed = []
+    for i, l in enumerate(lines):
+        swayed.append((" " + l) if i < trunk_start else l)
+    return [art, "\n".join(swayed)]
+
+
+def make_ridge(w, mh, snowline):
+    cols = []
+    level = random.randint(1, max(2, mh // 2))
+    while len(cols) < w:
+        peak = random.randint(3, mh)
+        for yy in range(level, peak + 1):
+            cols.append(("/", yy))
+        valley = random.randint(1, max(1, mh // 2))
+        for yy in range(peak - 1, valley - 1, -1):
+            cols.append(("\\", yy))
+        level = valley
+    grid = [[" "] * w for _ in range(mh)]
+    mask = [[" "] * w for _ in range(mh)]
+    for x in range(w):
+        ch, yy = cols[x]
+        row = mh - yy
+        if 0 <= row < mh:
+            grid[row][x] = ch
+            mask[row][x] = "W" if yy >= snowline else " "
+    return "\n".join("".join(r) for r in grid), "\n".join("".join(r) for r in mask)
+
+
+def make_water_frames(w):
+    """Four phase-shifted frames of the same surface = drifting shimmer."""
+    base = []
+    for density in (0.85, 0.28, 0.14):
+        base.append("".join("~" if random.random() < density else " " for _ in range(w)))
+    frames, masks = [], []
+    for k in range(4):
+        rows, mrows = [], []
+        for i, row in enumerate(base):
+            s = k * (i + 1) * 2 % w
+            shifted = row[s:] + row[:s]
+            rows.append(shifted)
+            letter = "N" if i == 0 else "n"
+            mrows.append("".join(letter if ch == "~" else " " for ch in shifted))
+        frames.append("\n".join(rows))
+        masks.append("\n".join(mrows))
+    return frames, masks
+
+
+def make_grass(w):
+    art, mask = [], []
+    for density in (0.28, 0.45):
+        row, mrow = [], []
+        for _ in range(w):
+            roll = random.random()
+            if roll < density * 0.06:
+                row.append("Y"); mrow.append("F")          # tiny fern
+            elif roll < density:
+                ch = random.choice(".,'\"`,")
+                row.append(ch); mrow.append(random.choice("gfF"))
+            else:
+                row.append(" "); mrow.append(" ")
+        art.append("".join(row))
+        mask.append("".join(mrow))
+    return "\n".join(art), "\n".join(mask)
+
+
+# --------------------------------------------------------------------------
+# engine
+# --------------------------------------------------------------------------
+
+class Entity:
+    def __init__(self, frames, x, y, z, *, masks=None, color="w", dx=0.0, dy=0.0,
+                 anim_every=6, die_offscreen=False, floor=None, expires=None,
+                 update_fn=None, kind="misc", data=None):
+        self.x, self.y, self.z = float(x), float(y), z
+        self.dx, self.dy = dx, dy
+        self.color = color
+        self.anim_every = anim_every
+        self.die_offscreen = die_offscreen
+        self.floor = floor
+        self.expires = expires
+        self.update_fn = update_fn
+        self.kind = kind
+        self.data = data or {}
+        self.frame_idx = 0
+        self._anim_tick = 0
+        self.dead = False
+        self.hidden = False
+        self.clip_y = None      # rows below this screen row are not drawn
+        self.set_art(frames, masks)
+
+    def set_art(self, frames, masks=None):
+        self.frames = [frame_lines(f) for f in frames]
+        self.masks = [frame_lines(m) for m in masks] if masks else None
+        self.width = max((len(l) for f in self.frames for l in f), default=1)
+        self.height = max((len(f) for f in self.frames), default=1)
+        self.frame_idx = min(self.frame_idx, len(self.frames) - 1)
+        self.runs = [self._compile(i) for i in range(len(self.frames))]
+
+    def _compile(self, i):
+        rows = []
+        lines = self.frames[i]
+        mlines = self.masks[i] if self.masks else None
+        for r, line in enumerate(lines):
+            mline = mlines[r] if mlines and r < len(mlines) else ""
+            runs = []
+            col = 0
+            n = len(line)
+            while col < n:
+                if line[col] == " ":
+                    col += 1
+                    continue
+                letter = mline[col] if col < len(mline) and mline[col] != " " else self.color
+                start = col
+                while (col < n and line[col] != " "
+                       and (mline[col] if col < len(mline) and mline[col] != " " else self.color) == letter):
+                    col += 1
+                # '?' is an opaque space: blanks whatever is behind the sprite
+                runs.append((start, line[start:col].replace("?", " "), letter))
+            rows.append(runs)
+        return rows
+
+    def default_move(self):
+        self.x += self.dx
+        self.y += self.dy
+        self._anim_tick += 1
+        if self._anim_tick >= self.anim_every and len(self.frames) > 1:
+            self._anim_tick = 0
+            self.frame_idx = (self.frame_idx + 1) % len(self.frames)
+
+    def update(self, scene, now):
+        if self.update_fn:
+            self.update_fn(self, scene, now)
+        else:
+            self.default_move()
+        if self.expires is not None and now >= self.expires:
+            self.dead = True
+        if self.floor is not None and self.y + self.height - 1 >= self.floor:
+            self.dead = True
+        if self.die_offscreen:
+            if self.dx > 0 and self.x > scene.w:
+                self.dead = True
+            elif self.dx < 0 and self.x + self.width < 0:
+                self.dead = True
+            if self.dy > 0 and self.y > scene.h:
+                self.dead = True
+
+    def draw(self, scr, h, w):
+        if self.hidden:
+            return
+        xi, yi = int(self.x), int(self.y)
+        yi += self.height - len(self.frames[self.frame_idx])   # bottom-align
+        for r, runs in enumerate(self.runs[self.frame_idx]):
+            sy = yi + r
+            if sy < 0 or sy >= h:
+                continue
+            if self.clip_y is not None and sy > self.clip_y:
+                break
+            for col, text, letter in runs:
+                sx = xi + col
+                if sx + len(text) <= 0 or sx >= w:
+                    continue
+                if sx < 0:
+                    text = text[-sx:]
+                    sx = 0
+                if sx + len(text) > w:
+                    text = text[: w - sx]
+                try:
+                    scr.addstr(sy, sx, text, ATTRS.get(letter, curses.A_NORMAL))
+                except curses.error:
+                    pass
+
+
+# --------------------------------------------------------------------------
+# behaviors
+# --------------------------------------------------------------------------
+
+def walker_update(e, s, now):
+    """Ground gait: forward motion plus a subtle body bob tied to stride."""
+    e.default_move()
+    d = e.data
+    e.y = d["base_y"] + d.get("bob_amp", 0.4) * math.sin(e.x * d.get("bob_freq", 0.4))
+
+
+def rabbit_update(e, s, now):
+    d = e.data
+    if d.get("airborne"):
+        d["vy"] += 0.075
+        e.y += d["vy"]
+        e.x += e.dx
+        if e.y >= d["base_y"]:
+            e.y = d["base_y"]
+            d["airborne"] = False
+            d["rest"] = random.randint(3, 9)
+            e.set_art(d["ground"], None)
+    else:
+        d["rest"] -= 1
+        if d["rest"] <= 0:
+            d["airborne"] = True
+            d["vy"] = -0.55
+            e.set_art(d["air"], None)
+    if e.dx > 0 and e.x > s.w or e.dx < 0 and e.x + e.width < 0:
+        e.dead = True
+
+
+def eagle_update(e, s, now):
+    d = e.data
+    if d["mode"] == "glide":
+        e.frame_idx = 0
+        e.x += e.dx
+        e.y = d["base_y"] + 1.4 * math.sin(now * 0.5 + d["phase"])
+        if now >= d["until"]:
+            d["mode"] = "flap"
+            d["until"] = now + random.uniform(1.2, 2.5)
+    else:
+        e.default_move()
+        e.y -= 0.04
+        d["base_y"] = e.y
+        if now >= d["until"]:
+            d["mode"] = "glide"
+            d["until"] = now + random.uniform(3.0, 7.0)
+
+
+def squatch_update(e, s, now):
+    d = e.data
+    if d.get("paused_until", 0) > now:
+        return
+    if "saved_dx" in d:
+        e.dx = d.pop("saved_dx")
+    if now >= d.get("next_pause", 0) and 10 < e.x < s.w - e.width - 10:
+        d["saved_dx"] = e.dx
+        e.dx = 0.0
+        d["paused_until"] = now + random.uniform(2.0, 5.0)
+        d["next_pause"] = now + random.uniform(8.0, 20.0)
+        return
+    walker_update(e, s, now)
+    # footprints
+    if abs(e.x - d.get("last_print", e.x)) >= 7:
+        d["last_print"] = e.x
+        foot_x = e.x + (4 if e.dx > 0 else e.width - 6)
+        s.entities.append(Entity(
+            [". ."], foot_x, s.ground_top + 1, 6.9, color="t",
+            expires=now + random.uniform(6, 12), kind="fx",
+        ))
+
+
+def baby_update(e, s, now):
+    p = e.data.get("parent")
+    if p is not None and not p.dead:
+        gap = e.data["gap"]
+        tx = p.x - gap if e.data["dir"] > 0 else p.x + p.width + gap - e.width
+        e.dx = max(-0.4, min(0.4, (tx - e.x) * 0.04))
+    else:
+        e.dx = e.data["base_dx"]
+    e.default_move()
+    e.y = e.data["base_y"] + 0.45 * math.sin(e.x * 0.5)
+
+
+def orca_update(e, s, now):
+    """Porpoising: travel submerged, roll at the surface to blow, rarely breach.
+
+    States: under -> roll (blow/arc/sink art follows an eased rise+fall)
+            under -> breach (parabolic leap, splash) -> under
+    """
+    d = e.data
+    dirn = 1 if e.dx > 0 else -1
+    e.x += e.dx
+    st = d["state"]
+
+    if st == "under":
+        e.hidden = True
+        if abs(e.x - d["last_event_x"]) >= d["gap"]:
+            d["last_event_x"] = e.x
+            mid = s.w * 0.25 < e.x < s.w * 0.75
+            if mid and not d["breached"] and random.random() < 0.35:
+                d.update(state="breach", t=0, vy=-0.85, breached=True)
+                e.set_art([d["leap"]], [d["leap_m"]])
+                e.y = d["surface_y"] - 1
+            else:
+                d.update(state="roll", t=0)
+
+    elif st == "roll":
+        e.hidden = False
+        d["t"] += 1
+        prog = d["t"] / d["roll_len"]
+        if prog >= 1.0:
+            d["state"] = "under"
+            d["gap"] = random.uniform(18, 42)
+            e.hidden = True
+            return
+        # pick roll art by phase: blow -> full back arc -> sinking fin
+        if prog < 0.3:
+            art, m = d["blow"], d["blow_m"]
+        elif prog < 0.72:
+            art, m = d["arc"], d["arc_m"]
+        else:
+            art, m = d["sink"], d["sink_m"]
+        if d.get("cur") != art:
+            d["cur"] = art
+            e.set_art([art], [m])
+        # eased rise and fall through the surface
+        lift = math.sin(prog * math.pi) * (e.height - 1)
+        e.y = d["surface_y"] - lift + 1
+
+    elif st == "breach":
+        e.hidden = False
+        d["vy"] += 0.06
+        e.y += d["vy"]
+        if d["vy"] > 0 and d.get("cur") != "dive":
+            d["cur"] = "dive"
+            e.set_art([d["dive"]], [d["dive_m"]])
+        if d["vy"] > 0 and e.y >= d["surface_y"] - 2:
+            s.splash(e.x + e.width // 2, d["surface_y"])
+            d["state"] = "under"
+            d["gap"] = random.uniform(24, 48)
+            d["cur"] = None
+            e.hidden = True
+
+    if (dirn > 0 and e.x > s.w + 4) or (dirn < 0 and e.x + e.width < -4):
+        e.dead = True
+
+
+def salmon_update(e, s, now):
+    d = e.data
+    d["vy"] += 0.09
+    e.y += d["vy"]
+    e.x += e.dx
+    if e.y >= d["water_y"]:
+        s.plip(e.x + e.width // 2, d["water_y"])
+        e.dead = True
+
+
+def smoke_update(e, s, now):
+    d = e.data
+    d["age"] += 1
+    e.x += s.wind * 0.5 + 0.08 * math.sin(d["age"] * 0.25 + d["seed"])
+    e.y -= 0.14
+    stage = "." if d["age"] < 18 else ("o" if d["age"] < 40 else "O")
+    if stage != d["stage"]:
+        d["stage"] = stage
+        e.set_art([stage])
+        e.color = "l" if stage != "O" else "d"
+        e.runs = [e._compile(i) for i in range(len(e.frames))]
+    if d["age"] > 60 or e.y < 1:
+        e.dead = True
+
+
+def firefly_update(e, s, now):
+    d = e.data
+    d["age"] += 1
+    if d["age"] % 6 == 0:
+        e.dx = random.uniform(-0.15, 0.15)
+        e.dy = random.uniform(-0.08, 0.08)
+    e.x += e.dx
+    e.y = max(d["min_y"], min(d["max_y"], e.y + e.dy))
+    e.hidden = (d["age"] // random.choice((7, 9))) % 3 == 2
+    if d["age"] > d["life"] or s.daypart() == "day":
+        e.dead = True
+
+
+def star_update(e, s, now):
+    e._anim_tick += 1
+    if e._anim_tick >= e.anim_every:
+        e._anim_tick = 0
+        e.frame_idx = (e.frame_idx + 1) % len(e.frames)
+    if s.daypart() in ("day", "dawn"):
+        e.dead = True
+
+
+def celestial_update(e, s, now):
+    """Sun or moon arcing across the sky over its half of the cycle."""
+    frac = e.data["frac_fn"](s)
+    if frac is None:
+        e.dead = True
+        return
+    e.x = 2 + frac * max(1, s.w - e.width - 4)
+    e.y = 1 + (1 - math.sin(math.pi * frac)) * 4
+
+
+def aurora_update(e, s, now):
+    d = e.data
+    d["t"] += 1
+    life, t = d["life"], d["t"]
+    if t >= life or s.daypart() != "night":
+        e.dead = True
+        return
+    if t % 3:
+        return
+    envelope = smooth(min(t / 60.0, (life - t) / 60.0, 1.0))
+    w, rows = s.w, 4
+    grid = [[" "] * w for _ in range(rows)]
+    mrows = [[" "] * w for _ in range(rows)]
+    palette = "gGcCm"
+    for x in range(0, w, 1):
+        v = math.sin(x * 0.13 + t * 0.045) + 0.6 * math.sin(x * 0.041 - t * 0.02)
+        height = (v + 1.6) / 3.2 * rows * envelope
+        for row in range(rows):
+            if rows - row <= height and random.random() < 0.8:
+                grid[row][x] = "|" if (x + row) % 3 else ")"
+                mrows[row][x] = palette[(x // 7 + t // 9 + row) % len(palette)]
+    e.set_art(["\n".join("".join(r) for r in grid)],
+              ["\n".join("".join(r) for r in mrows)])
+
+
+def sway_update(e, s, now):
+    """Trees: sway only when the wind is up or it's raining."""
+    if abs(s.wind) > 0.18 or s.raining:
+        e._anim_tick += 1
+        if e._anim_tick >= e.anim_every:
+            e._anim_tick = 0
+            e.frame_idx = (e.frame_idx + 1) % len(e.frames)
+    else:
+        e.frame_idx = 0
+
+
+# --------------------------------------------------------------------------
+# critters
+# --------------------------------------------------------------------------
+
+CRITTERS = [
+    dict(name="deer", frames=DEER_FRAMES, color="T", speed=(0.22, 0.34), weight=3),
+    dict(name="elk", frames=ELK_FRAMES, color="T", speed=(0.16, 0.26), weight=1),
+    dict(name="bear", frames=BEAR_FRAMES, color="t", speed=(0.09, 0.16), weight=2),
+    dict(name="rabbit", frames=[RABBIT_GROUND], color="l", speed=(0.30, 0.45), weight=3, hopper=True),
+    dict(name="eagle", frames=[EAGLE_GLIDE, EAGLE_UP, EAGLE_DOWN], color="t",
+         speed=(0.38, 0.55), weight=2, fly=True),
+    dict(name="geese", frames=[GEESE], color="l", speed=(0.28, 0.42), weight=1, fly=True),
+    dict(name="owl", frames=OWL_FRAMES, color="T", speed=(0.30, 0.42), weight=0, fly=True, night=True),
+]
+
+
+# --------------------------------------------------------------------------
+# scene
+# --------------------------------------------------------------------------
+
+class Scene:
+    def __init__(self, scr):
+        self.scr = scr
+        self.entities = []
+        self.paused = False
+        self.start_time = time.monotonic()
+        self.build()
+
+    # -- daylight ------------------------------------------------------------
+
+    def daypart(self):
+        t = self.cycle_t % CYCLE_LEN
+        if t < DAY_LEN:
+            return "day"
+        if t < DAY_LEN + DUSK_LEN:
+            return "dusk"
+        if t < DAY_LEN + DUSK_LEN + NIGHT_LEN:
+            return "night"
+        return "dawn"
+
+    def day_frac(self):
+        t = self.cycle_t % CYCLE_LEN
+        return t / DAY_LEN if t < DAY_LEN else None
+
+    def night_frac(self):
+        t = self.cycle_t % CYCLE_LEN
+        n0 = DAY_LEN + DUSK_LEN
+        return (t - n0) / NIGHT_LEN if n0 <= t < n0 + NIGHT_LEN else None
+
+    def skip_time(self):
+        t = self.cycle_t % CYCLE_LEN
+        for edge in (DAY_LEN, DAY_LEN + DUSK_LEN, DAY_LEN + DUSK_LEN + NIGHT_LEN, CYCLE_LEN):
+            if t < edge:
+                self.cycle_t += edge - t
+                break
+
+    # -- construction ----------------------------------------------------------
+
+    def build(self):
+        self.entities = []
+        self.h, self.w = self.scr.getmaxyx()
+        self.ground_top = self.h - 3
+        now = time.monotonic()
+        self.cycle_t = getattr(self, "cycle_t", random.uniform(0, DAY_LEN * 0.6))
+        self.last_part = None
+
+        self.wind = 0.0
+        self.raining = False
+        self.rain_manual = False
+        self.rain_until = 0.0
+        self.rain_started = 0.0
+        self.next_weather = now + random.uniform(60, 180)
+        self.splash_count = 0
+
+        self.next_critter = now + random.uniform(2, 6)
+        self.next_squatch = now + random.uniform(20, 60)
+        self.next_orca = now + random.uniform(20, 75)
+        self.next_salmon = now + random.uniform(30, 120)
+        self.next_firefly = now
+        self.next_smoke = now
+        self.aurora_active = False
+
+        if self.h < 10 or self.w < 30:
+            return
+
+        art, mask = make_grass(self.w)
+        self.entities.append(Entity([art], 0, self.h - 2, 7, masks=[mask], color="g"))
+
+        # the Sound
+        self.water_top = None
+        if self.h >= 28:
+            self.water_top = self.ground_top - 16
+            frames, masks = make_water_frames(self.w)
+            self.entities.append(Entity(frames, 0, self.water_top, 8.7,
+                                        masks=masks, color="n", anim_every=6))
+
+        # two mountain ridges for depth
+        base = self.water_top if self.water_top is not None else self.h - 2
+        near_h = max(5, min(12, self.h // 3))
+        far_h = max(4, near_h - 3)
+        fa, fm = make_ridge(self.w, far_h, far_h - 1)
+        self.entities.append(Entity([fa], 0, max(0, base - near_h - 2), 9.5,
+                                    masks=[fm], color="d"))
+        na, nm = make_ridge(self.w, near_h, near_h - 1)
+        self.entities.append(Entity([na], 0, max(0, base - near_h), 9.2,
+                                    masks=[nm], color="l"))
+
+        # forest (leave a clearing for the campsite on the right)
+        camp_left = self.w - 26 if self.w >= 70 else self.w
+        count = max(2, self.w // 13)
+        slot = self.w / count
+        for i in range(count):
+            art = random.choice(TREES)
+            frames = tree_frames(art)
+            shade = random.choice(("f", "f", "F"))
+            tree = Entity(frames, 0, 0, 6 + random.random() * 0.8, color=shade,
+                          masks=[mask_from(f, {"|": "t"}) for f in frames],
+                          anim_every=random.randint(6, 10), update_fn=sway_update)
+            tree.x = min(self.w - tree.width - 1,
+                         max(0, int(slot * i + random.uniform(0, max(1, slot - tree.width)))))
+            if tree.x + tree.width > camp_left:
+                continue
+            tree.y = self.ground_top - tree.height + 1
+            self.entities.append(tree)
+
+        # campsite
+        self.fire = None
+        if self.w >= 70:
+            tent = Entity([TENT], 0, 0, 5, color="y",
+                          masks=[mask_from(TENT, {"_": "o"})])
+            tent.x = self.w - tent.width - 6
+            tent.y = self.ground_top - tent.height + 1
+            self.entities.append(tent)
+            self.fire = Entity(FIRE_FRAMES, tent.x - 10, self.ground_top - 2, 4.9,
+                               masks=FIRE_MASKS, color="R", anim_every=3)
+            self.entities.append(self.fire)
+
+        for _ in range(max(2, self.w // 45)):
+            self.spawn_cloud(anywhere=True)
+        self.refresh_daylight(force=True)
+
+    # -- spawners ----------------------------------------------------------
+
+    def spawn_cloud(self, anywhere=False):
+        art = random.choice(CLOUDS) if random.random() < 0.75 else WISP
+        dx = random.uniform(0.03, 0.12) * (1 if self.wind >= 0 else -1)
+        shade = "l" if self.daypart() in ("night", "dusk") else random.choice("wWl")
+        e = Entity([art], 0, random.randint(0, 4), 10, color=shade,
+                   dx=dx or 0.05, die_offscreen=True, kind="cloud")
+        e.x = random.randint(0, max(1, self.w - e.width)) if anywhere else (
+            -e.width if e.dx > 0 else self.w)
+        self.entities.append(e)
+
+    def spawn_critter(self):
+        pool = [c for c in CRITTERS if c["weight"] > 0]
+        part = self.daypart()
+        weights = []
+        for c in pool:
+            wgt = c["weight"]
+            if part in ("dusk", "dawn") and c["name"] in ("deer", "elk"):
+                wgt *= 2          # crepuscular
+            if part == "night" and not c.get("fly") and c["name"] != "rabbit":
+                wgt = max(1, wgt - 1)
+            weights.append(wgt)
+        if part == "night":
+            pool = pool + [next(c for c in CRITTERS if c["name"] == "owl")]
+            weights = weights + [3]
+        spec = random.choices(pool, weights=weights)[0]
+        herd = 2 if spec["name"] == "deer" and random.random() < 0.4 else 1
+        dirn = random.choice([1, -1])
+        for i in range(herd):
+            frames = spec["frames"] if dirn > 0 else [mirror(f) for f in spec["frames"]]
+            speed = random.uniform(*spec["speed"]) * dirn
+            if spec.get("hopper"):
+                ground = frames
+                air = [RABBIT_AIR] if dirn > 0 else [mirror(RABBIT_AIR)]
+                e = Entity(ground, 0, 0, 4 + random.random() * 0.5, color=spec["color"],
+                           dx=speed, kind="critter", update_fn=rabbit_update,
+                           data={"ground": ground, "air": air, "rest": 2,
+                                 "airborne": False, "vy": 0.0})
+            elif spec.get("fly"):
+                e = Entity(frames, 0, 0, 8, color=spec["color"], dx=speed,
+                           die_offscreen=True, anim_every=3, kind="critter",
+                           update_fn=eagle_update if spec["name"] in ("eagle", "owl") else None,
+                           data={"mode": "flap", "until": time.monotonic() + 2,
+                                 "phase": random.uniform(0, 6.3), "base_y": 0})
+            else:
+                e = Entity(frames, 0, 0, 4 + random.random() * 0.5, color=spec["color"],
+                           dx=speed, die_offscreen=True, anim_every=5, kind="critter",
+                           update_fn=walker_update,
+                           data={"base_y": 0, "bob_amp": 0.35,
+                                 "bob_freq": 0.55 if spec["name"] != "bear" else 0.3})
+            if spec.get("fly"):
+                e.y = random.randint(1, max(2, self.h // 4))
+                e.data["base_y"] = float(e.y)
+            else:
+                e.y = self.ground_top - e.height + 1
+                e.data["base_y"] = float(e.y)
+            e.x = (-e.width - i * (e.width + 4)) if dirn > 0 else (self.w + i * (e.width + 4))
+            self.entities.append(e)
+
+    def spawn_squatch(self):
+        dirn = random.choice([1, -1])
+        frames = SQUATCH_FRAMES if dirn > 0 else [mirror(f) for f in SQUATCH_FRAMES]
+        masks = [mask_from(f, {"o": "E", "=": "t"}) for f in frames]
+        speed = random.uniform(0.13, 0.20) * dirn
+        e = Entity(frames, 0, 0, 3, masks=masks, color="S", dx=speed,
+                   die_offscreen=True, anim_every=5, kind="squatch",
+                   update_fn=squatch_update,
+                   data={"next_pause": time.monotonic() + random.uniform(4, 10),
+                         "base_y": 0, "bob_amp": 0.5, "bob_freq": 0.16})
+        e.y = self.ground_top - e.height + 1
+        e.data["base_y"] = float(e.y)
+        e.x = -e.width if dirn > 0 else self.w
+        self.entities.append(e)
+
+        if random.random() < 0.25:
+            bframes = BABY_SQUATCH_FRAMES if dirn > 0 else [mirror(f) for f in BABY_SQUATCH_FRAMES]
+            bmasks = [mask_from(f, {"o": "E"}) for f in bframes]
+            b = Entity(bframes, 0, 0, 2.9, masks=bmasks, color="S", dx=speed,
+                       die_offscreen=True, anim_every=4, kind="squatch",
+                       update_fn=baby_update,
+                       data={"parent": e, "gap": 15, "dir": dirn,
+                             "base_dx": speed, "base_y": 0})
+            b.y = self.ground_top - b.height + 1
+            b.data["base_y"] = float(b.y)
+            b.x = e.x - 15 if dirn > 0 else e.x + e.width + 15
+            self.entities.append(b)
+
+    def spawn_orca(self):
+        if self.water_top is None:
+            return
+        dirn = random.choice([1, -1])
+        arts = {}
+        for key, art in (("blow", ORCA_BLOW), ("arc", ORCA_ROLL), ("sink", ORCA_SINK),
+                         ("leap", ORCA_LEAP), ("dive", ORCA_DIVE)):
+            a = art if dirn > 0 else mirror(art)
+            arts[key] = a
+            if key == "blow":
+                # spray (top two rows) in water color, body below
+                rows = a.split("\n")
+                arts[key + "_m"] = "\n".join(
+                    "".join("N" if ch != " " else " " for ch in row)
+                    if i < 3 else mask_from(row, {"o": "W"})
+                    for i, row in enumerate(rows))
+            else:
+                arts[key + "_m"] = mask_from(a, {"o": "W"})
+        e = Entity([arts["arc"]], 0, 0, 8.8, masks=[arts["arc_m"]], color="d",
+                   dx=random.uniform(0.22, 0.34) * dirn, kind="orca",
+                   update_fn=orca_update,
+                   data=dict(state="under", t=0, roll_len=52, breached=False,
+                             gap=random.uniform(12, 26), last_event_x=0.0,
+                             surface_y=float(self.water_top), cur=None, **arts))
+        e.y = self.water_top
+        e.x = -e.width if dirn > 0 else self.w
+        e.data["last_event_x"] = e.x
+        e.hidden = True
+        e.clip_y = self.water_top + 2   # body stays beneath the surface
+        self.entities.append(e)
+
+    def spawn_salmon(self):
+        if self.water_top is None:
+            return
+        dirn = random.choice([1, -1])
+        art = SALMON if dirn > 0 else mirror(SALMON)
+        e = Entity([art], random.randint(10, max(11, self.w - 20)), self.water_top, 8.6,
+                   color="r", dx=random.uniform(0.3, 0.5) * dirn, kind="fx",
+                   update_fn=salmon_update,
+                   data={"vy": -0.75, "water_y": float(self.water_top)})
+        e.clip_y = self.water_top + 1
+        self.plip(e.x + 3, self.water_top)
+        self.entities.append(e)
+
+    def splash(self, x, y):
+        e = Entity(SPLASH_FRAMES, x - 7, y - 1, 8.5, color="N", anim_every=3, kind="fx",
+                   expires=time.monotonic() + 0.7)
+        self.entities.append(e)
+
+    def plip(self, x, y):
+        self.entities.append(Entity(["'"], x, y - 1, 8.5, color="N", kind="fx",
+                                    expires=time.monotonic() + 0.25))
+
+    def spawn_mist(self, n):
+        for _ in range(n):
+            length = random.randint(12, 28)
+            art = "".join(random.choice("~-~~ ") for _ in range(length))
+            e = Entity([art], random.randint(0, max(1, self.w - length)),
+                       random.randint(self.ground_top - 9, self.ground_top - 2),
+                       3.5, color="l", dx=random.uniform(0.03, 0.09) * random.choice([1, -1]),
+                       kind="fx", expires=time.monotonic() + random.uniform(20, 45))
+            self.entities.append(e)
+
+    # -- daylight transitions ----------------------------------------------
+
+    def refresh_daylight(self, force=False):
+        part = self.daypart()
+        if part == self.last_part and not force:
+            return
+        self.last_part = part
+        set_night_palette(part == "night")
+        self.entities = [e for e in self.entities if e.kind not in ("star", "sky")]
+        if part in ("day", "dawn"):
+            self.entities.append(Entity([SUN], 2, 2, 9.9, color="Y", kind="sky",
+                                        masks=[mask_from(SUN, {"#": "Y", "-": "o",
+                                                               "\\": "o", "/": "o", "|": "o"})],
+                                        update_fn=celestial_update,
+                                        data={"frac_fn": Scene.day_frac}))
+        if part == "night":
+            self.entities.append(Entity([MOON], 2, 2, 9.9, color="L", kind="sky",
+                                        update_fn=celestial_update,
+                                        data={"frac_fn": Scene.night_frac}))
+            sky_limit = max(3, (self.water_top or self.h // 2) - 6)
+            for _ in range(max(6, self.w // 7)):
+                seq = random.sample([".", "+", ".", " ", "."], 5)
+                self.entities.append(Entity(
+                    seq, random.randint(0, self.w - 1), random.randint(0, sky_limit), 9.95,
+                    color=random.choice("lwW"), anim_every=random.randint(8, 30),
+                    kind="star", update_fn=star_update))
+
+    # -- weather -----------------------------------------------------------
+
+    def toggle_rain(self):
+        if self.raining:
+            self.raining = False
+            self.rain_manual = False
+            self.next_weather = time.monotonic() + random.uniform(90, 240)
+            self.after_rain()
+        else:
+            self.raining = True
+            self.rain_manual = True
+            self.rain_started = time.monotonic()
+            self.wind = random.uniform(-0.45, 0.45)
+
+    def after_rain(self):
+        self.spawn_mist(random.randint(2, 4))
+
+    def weather(self, now):
+        # wind drifts slowly; storms crank it up
+        target = self.wind + random.uniform(-0.012, 0.012)
+        limit = 0.6 if self.raining else 0.25
+        self.wind = max(-limit, min(limit, target))
+
+        if not self.raining and now >= self.next_weather:
+            self.raining = True
+            self.rain_manual = False
+            self.rain_started = now
+            self.rain_until = now + random.uniform(25, 70)
+            self.wind = random.uniform(-0.45, 0.45)
+        elif self.raining and not self.rain_manual and now >= self.rain_until:
+            self.raining = False
+            self.next_weather = now + random.uniform(90, 240)
+            self.after_rain()
+
+        if self.raining:
+            ramp = smooth((now - self.rain_started) / 6.0)
+            if not self.rain_manual:
+                ramp = min(ramp, smooth((self.rain_until - now) / 6.0))
+            ch = "|" if abs(self.wind) < 0.15 else ("\\" if self.wind > 0 else "/")
+            for _ in range(max(1, int(self.w / 14 * ramp))):
+                self.entities.append(Entity(
+                    [ch], random.randint(0, self.w - 1), 0, 1,
+                    color=random.choice("cbN"), dx=self.wind, dy=0.95,
+                    floor=self.ground_top + 1, kind="rain"))
+            # splashes where drops land
+            if self.splash_count < 30 and random.random() < ramp * 0.7:
+                self.entities.append(Entity(
+                    [random.choice(".,")], random.randint(0, self.w - 1),
+                    self.ground_top, 1.1, color="c", kind="fx",
+                    expires=now + 0.15))
+            # lightning
+            if random.random() < 0.0035 * ramp:
+                bx = random.randint(5, max(6, self.w - 10))
+                self.entities.append(Entity(
+                    [BOLT], bx, random.randint(1, 4), 0.5, color="Y", kind="fx",
+                    expires=now + 0.18))
+                try:
+                    curses.flash()
+                except curses.error:
+                    pass
+
+    # -- per-frame ---------------------------------------------------------
+
+    def tick(self):
+        now = time.monotonic()
+        self.cycle_t += FRAME_MS / 1000.0
+        part = self.daypart()
+        self.refresh_daylight()
+
+        for e in self.entities:
+            e.update(self, now)
+        self.entities = [e for e in self.entities if not e.dead]
+        self.splash_count = sum(1 for e in self.entities if e.kind == "fx")
+
+        if sum(1 for e in self.entities if e.kind == "cloud") < max(2, self.w // 45):
+            self.spawn_cloud()
+        if now >= self.next_critter:
+            if sum(1 for e in self.entities if e.kind == "critter") < 3:
+                self.spawn_critter()
+            self.next_critter = now + random.uniform(6, 18)
+        if now >= self.next_squatch:
+            if not any(e.kind == "squatch" for e in self.entities):
+                self.spawn_squatch()
+            self.next_squatch = now + random.uniform(60, 180)
+        if now >= self.next_orca:
+            if not any(e.kind == "orca" for e in self.entities):
+                self.spawn_orca()
+            self.next_orca = now + random.uniform(60, 180)
+        if now >= self.next_salmon:
+            if not self.raining:
+                self.spawn_salmon()
+            self.next_salmon = now + random.uniform(45, 150)
+
+        # campfire smoke
+        if self.fire is not None and now >= self.next_smoke:
+            self.next_smoke = now + random.uniform(0.3, 0.7)
+            if sum(1 for e in self.entities if e.kind == "smoke") < 12:
+                self.entities.append(Entity(
+                    ["."], self.fire.x + 3, self.fire.y - 1, 4.8, color="l",
+                    kind="smoke", update_fn=smoke_update,
+                    data={"age": 0, "stage": ".", "seed": random.uniform(0, 6.3)}))
+
+        # fireflies at dusk and night
+        if part in ("dusk", "night") and now >= self.next_firefly:
+            self.next_firefly = now + random.uniform(1.5, 4)
+            if sum(1 for e in self.entities if e.kind == "firefly") < 7:
+                self.entities.append(Entity(
+                    ["*"], random.randint(3, self.w - 4),
+                    random.randint(self.ground_top - 8, self.ground_top - 1), 2.5,
+                    color="Y", kind="firefly", update_fn=firefly_update,
+                    data={"age": 0, "life": random.randint(240, 600),
+                          "min_y": self.ground_top - 10, "max_y": self.ground_top}))
+
+        # aurora, rarely, on clear nights
+        if (part == "night" and not self.raining
+                and not any(e.kind == "aurora" for e in self.entities)
+                and random.random() < 1 / 3000):
+            self.entities.append(Entity(
+                [" "], 0, 0, 9.97, color="G", kind="aurora",
+                update_fn=aurora_update, data={"t": 0, "life": random.randint(450, 750)}))
+
+        self.weather(now)
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = self.h, self.w
+        if h < 10 or w < 30:
+            try:
+                scr.addstr(0, 0, "terminal too small for the wilderness")
+            except curses.error:
+                pass
+            scr.refresh()
+            return
+        for e in sorted(self.entities, key=lambda e: -e.z):
+            e.draw(scr, h, w)
+        if time.monotonic() - self.start_time < HINT_SECONDS:
+            hint = " q quit · p pause · w rain · n time "
+            try:
+                scr.addstr(h - 1, 1, hint[: w - 2], ATTRS.get("d", curses.A_DIM))
+            except curses.error:
+                pass
+        scr.refresh()
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main(scr):
+    curses.curs_set(0)
+    scr.timeout(FRAME_MS)
+    init_colors()
+    scene = Scene(scr)
+    while True:
+        ch = scr.getch()
+        if ch != -1:
+            key = chr(ch).lower() if 0 <= ch < 256 else ""
+            if key == "q":
+                return
+            elif key in ("p", " "):
+                scene.paused = not scene.paused
+            elif key == "r" or ch == curses.KEY_RESIZE:
+                scene.build()
+            elif key == "w":
+                scene.toggle_rain()
+            elif key == "n":
+                scene.skip_time()
+            elif key == "s":
+                if not any(e.kind == "squatch" for e in scene.entities):
+                    scene.spawn_squatch()
+            elif key == "o":
+                if not any(e.kind == "orca" for e in scene.entities):
+                    scene.spawn_orca()
+        if not scene.paused:
+            scene.tick()
+        scene.draw()
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
