@@ -11,10 +11,19 @@ through: deer, elk, bears, rabbits, eagles, geese, night owls, leaping
 salmon, and orcas that surface to blow like the real thing. If you're
 patient, the big guy himself will amble past.
 
+## Install
+
+```sh
+brew tap hammaridgeventures/tap
+brew install squatchy
+```
+
+Or clone the repo and run the script directly.
+
 ## Run
 
 ```sh
-./squatchy
+squatchy
 ```
 
 Needs only Python 3 and a curses-capable terminal (macOS/Linux).
