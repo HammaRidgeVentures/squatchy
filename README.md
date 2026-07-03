@@ -3,6 +3,8 @@
 A Pacific Northwest scene in ASCII art, in the spirit of
 [asciiquarium](https://robobunny.com/projects/asciiquarium/).
 
+![squatchy — Pacific Northwest ASCII art scene](assets/squatchy.jpg)
+
 Two ridgelines of snow-capped mountains, the Sound below them, evergreen
 forest, a campsite with a crackling fire — and the wildlife that wanders
 through: deer, elk, bears, rabbits, eagles, geese, night owls, leaping
